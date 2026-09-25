@@ -418,8 +418,35 @@ pub struct StoreEntry {
     pub shader_map_hashes: Vec<FSHAHash>,
 }
 
+/// Width of one FFilePackageStoreEntry::ShaderMapHashes element. UE 5.6 and earlier store FSHAHash (SHA-1, 20 bytes);
+/// UE 5.8 stores FShaderHash (FXxHash64, 8 bytes) under the same EIoContainerHeaderVersion::SoftPackageReferencesOffset,
+/// so the header version cannot tell them apart. 8-byte hashes are kept in the first 8 bytes of an FSHAHash.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EShaderMapHashWidth {
+    #[default]
+    Sha1,
+    XxHash64,
+}
+impl EShaderMapHashWidth {
+    fn size(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::XxHash64 => 8,
+        }
+    }
+    /// The engine writes the arrays of the store entry buffer back to back after the fixed-size entries
+    /// (FStoreEntriesWriter in IoStoreUtilities.cpp), so the buffer length pins the hash width exactly.
+    /// Anything that does not add up to 8-byte hashes keeps the SHA-1 layout.
+    fn infer(entries: &[FFilePackageStoreEntry], entries_size: usize, buffer_len: usize) -> Self {
+        let hash_count: usize = entries.iter().map(|e| e.shader_map_hashes.array_num as usize).sum();
+        let imported_size: usize = entries.iter().map(|e| e.imported_packages.array_num as usize * size_of::<FPackageId>()).sum();
+        let array_data_size = buffer_len.checked_sub(entries_size + imported_size);
+        if hash_count != 0 && array_data_size == Some(hash_count * Self::XxHash64.size()) { Self::XxHash64 } else { Self::Sha1 }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-struct StoreEntries(BTreeMap<FPackageId, StoreEntry>);
+struct StoreEntries(BTreeMap<FPackageId, StoreEntry>, EShaderMapHashWidth);
 impl StoreEntries {
     fn get(&self, package_id: FPackageId) -> Option<StoreEntry> {
         self.0.get(&package_id).cloned()
@@ -429,6 +456,7 @@ impl StoreEntries {
         let package_ids: Vec<FPackageId> = s.de()?;
 
         let buffer: Vec<u8> = s.de()?;
+        let buffer_len = buffer.len();
         let mut cur = Cursor::new(buffer);
         //let mut cur = ser_hex::TraceStream::new("trace_store.json", &mut cur);
 
@@ -443,6 +471,7 @@ impl StoreEntries {
         };
 
         let entries = read_array(package_ids.len(), &mut cur, |s| FFilePackageStoreEntry::deserialize(s, version))?;
+        let hash_width = EShaderMapHashWidth::infer(&entries, entries.len() * entry_size, buffer_len);
 
         let entries = entries
             .into_iter()
@@ -474,7 +503,11 @@ impl StoreEntries {
                     new.shader_map_hashes = if num != 0 {
                         let offset = offset + member_offset + entry.shader_map_hashes.offset_to_data_from_this as usize + 8; // offset_of(FFilePackageStoreEntry::shader_map_hashes)
                         cur.seek(SeekFrom::Start(offset as u64))?;
-                        cur.de_ctx(num)?
+                        let mut hashes = vec![FSHAHash::default(); num];
+                        for hash in &mut hashes {
+                            cur.read_exact(&mut hash.0[..hash_width.size()])?;
+                        }
+                        hashes
                     } else {
                         vec![]
                     };
@@ -484,7 +517,7 @@ impl StoreEntries {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self(BTreeMap::from_iter(package_ids.into_iter().zip(entries.into_iter()))))
+        Ok(Self(BTreeMap::from_iter(package_ids.into_iter().zip(entries.into_iter())), hash_width))
     }
     #[instrument(skip_all, name = "StoreEntries")]
     fn serialize<S: Write>(&self, s: &mut S, version: EIoContainerHeaderVersion) -> Result<()> {
@@ -536,7 +569,9 @@ impl StoreEntries {
                 let offset = cur.position() as usize - entry_offset - member_offset - 8;
                 ser_entry.shader_map_hashes.offset_to_data_from_this = offset as u32;
                 ser_entry.shader_map_hashes.array_num = entry.shader_map_hashes.len() as u32;
-                cur.ser_no_length(&entry.shader_map_hashes)?;
+                for hash in &entry.shader_map_hashes {
+                    cur.write_all(&hash.0[..self.1.size()])?;
+                }
             }
 
             // advance array_offset
@@ -709,6 +744,29 @@ mod test {
     fn test_container_header_issue18() -> Result<()> {
         let data = fs::read("tests/issues/issue18/header.bin")?;
         test_rw_container_header(&data, Some(EIoContainerHeaderVersion::PreInitial))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_container_header_xxhash64_shader_map_hashes() -> Result<()> {
+        // UE 5.8 (Conan Exiles Enhanced pakchunk5050): 8-byte FShaderHash, the last store entry's hash ends the buffer
+        let data = fs::read("tests/UE5.8/ContainerHeader_1.bin")?;
+        let header = FIoContainerHeader::deserialize(&mut Cursor::new(&data), None)?;
+        assert_eq!(header.packages.1, EShaderMapHashWidth::XxHash64);
+        assert_eq!(header.packages.0.len(), 12);
+        assert_eq!(header.packages.0.values().map(|e| e.shader_map_hashes.len()).sum::<usize>(), 1);
+
+        let mut out_cur = Cursor::new(vec![]);
+        header.serialize(&mut out_cur)?;
+        assert_eq!(out_cur.into_inner(), data);
+        Ok(())
+    }
+
+    #[test]
+    fn test_container_header_sha1_shader_map_hashes() -> Result<()> {
+        let data = fs::read("tests/UE5.3/ContainerHeader_1.bin")?;
+        let header = FIoContainerHeader::deserialize(&mut Cursor::new(&data), None)?;
+        assert_eq!(header.packages.1, EShaderMapHashWidth::Sha1);
         Ok(())
     }
 
