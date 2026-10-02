@@ -44,6 +44,11 @@ impl Readable for FIoContainerHeader {
 impl FIoContainerHeader {
     #[instrument(skip_all, name = "FIoContainerHeader")]
     pub fn deserialize<S: Read>(s: &mut S, version_override: Option<EIoContainerHeaderVersion>) -> Result<Self> {
+        // The legacy layout probe below needs to look ahead, so work on a buffered copy of the whole header chunk
+        let mut buffer = Vec::new();
+        s.read_to_end(&mut buffer)?;
+        let s = &mut Cursor::new(buffer);
+
         let signature: u32 = s.de()?;
         let version: EIoContainerHeaderVersion;
         let container_id;
@@ -61,13 +66,19 @@ impl FIoContainerHeader {
             container_id = s.de()?;
         }
 
+        let mut _package_count = 0u32;
         if version < EIoContainerHeaderVersion::OptionalSegmentPackages {
-            let _package_count: u32 = s.de()?;
+            _package_count = s.de()?;
         }
 
         let mut new = Self::new(version, container_id);
 
         if version <= EIoContainerHeaderVersion::Initial {
+            // FINAL FANTASY VII REBIRTH (Square Enix UE 4.26) writes one extra u32 between the package count and the name buffer
+            if Self::has_legacy_unknown_prefix(s.get_ref(), s.position() as usize, _package_count) {
+                let _unknown: u32 = s.de()?;
+            }
+
             let names_buffer: Vec<u8> = s.de()?;
             let _name_hashes_buffer: Vec<u8> = s.de()?;
             let names = read_name_batch_parts(&names_buffer)?;
@@ -190,6 +201,22 @@ impl FIoContainerHeader {
 }
 impl FIoContainerHeader {
     const MAGIC: u32 = 0x496f436e;
+
+    /// Whether a legacy header has an extra u32 before its name buffer. The standard layout is
+    /// `names: Vec<u8>, name_hashes: Vec<u8>, package_ids: Vec<FPackageId>` with `package_ids.len() == package_count`;
+    /// the prefix is reported only when the standard layout does not hold and the prefixed one does.
+    fn has_legacy_unknown_prefix(data: &[u8], pos: usize, package_count: u32) -> bool {
+        let read_u32 = |at: usize| data.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+        let ids_len_at = |start: usize| -> Option<usize> {
+            let names_len = read_u32(start)?;
+            let hashes_at = (start + 4).checked_add(names_len)?;
+            let hashes_len = read_u32(hashes_at)?;
+            let ids_at = (hashes_at + 4).checked_add(hashes_len)?;
+            read_u32(ids_at)
+        };
+        let matches = |start: usize| ids_len_at(start) == Some(package_count as usize);
+        !matches(pos) && matches(pos + 4)
+    }
 
     pub fn new(version: EIoContainerHeaderVersion, container_id: FIoContainerId) -> Self {
         Self {
@@ -729,6 +756,16 @@ mod test {
     #[test]
     fn test_container_header_initial() -> Result<()> {
         let data = fs::read("tests/UE4.27/ContainerHeader_1.bin")?;
+        test_rw_container_header(&data, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_container_header_ff7r() -> Result<()> {
+        // FINAL FANTASY VII REBIRTH: UE 4.26 header with one extra u32 before the name buffer
+        let data = fs::read("tests/UE4.26_FF7R/ContainerHeader_1.bin")?;
+        let header = FIoContainerHeader::deserialize(&mut Cursor::new(&data), None)?;
+        assert_eq!(header.package_ids().count(), 93);
         test_rw_container_header(&data, None)?;
         Ok(())
     }
