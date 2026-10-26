@@ -446,12 +446,20 @@ impl FLegacyPackageFileSummary {
         let asset_magic_tag: u32 = FLegacyPackageFileSummary::PACKAGE_FILE_TAG;
         s.ser(&asset_magic_tag)?;
 
-        // Make sure we are not attempting to write versions before UE4 NonOuterPackageImport. Our export/import serialization does not support such old versions
-        if self.versioning_info.package_file_version.file_version_ue4 < EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32 {
+        // UE4.25 cooked packages use 518. With editor data filtered, neither the
+        // temporary owner GUID nor the later non-outer import package name is
+        // serialized, so their cooked layout is supported without relabelling
+        // the package as UE4.26. Keep editor-data packages below 520 unsupported.
+        let minimum_supported_version = if self.is_filter_editor_only() {
+            EUnrealEngineObjectUE4Version::AddedPackageOwner
+        } else {
+            EUnrealEngineObjectUE4Version::NonOuterPackageImport
+        } as i32;
+        if self.versioning_info.package_file_version.file_version_ue4 < minimum_supported_version {
             bail!(
                 "Attempt to write UE4 package file version {}, which is below minimum supported version {}",
                 self.versioning_info.package_file_version.file_version_ue4,
-                EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32
+                minimum_supported_version
             );
         }
 
@@ -1363,3 +1371,92 @@ pub const OBJECT_CLASS_NAME: &str = "Object";
 pub const CLASS_CLASS_NAME: &str = "Class";
 pub const PACKAGE_CLASS_NAME: &str = "Package";
 pub const PRESTREAM_PACKAGE_CLASS_NAME: &str = "PrestreamPackage";
+
+#[cfg(test)]
+mod cooked_ue425_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn summary(version: i32, filtered: bool) -> FLegacyPackageFileSummary {
+        FLegacyPackageFileSummary {
+            versioning_info: FLegacyPackageVersioningInfo {
+                package_file_version: FPackageFileVersion {
+                    file_version_ue4: version,
+                    file_version_ue5: 0,
+                },
+                ..Default::default()
+            },
+            package_name: "/Game/Test/CookedMesh".to_string(),
+            package_flags: if filtered { EPackageFlags::FilterEditorOnly as u32 } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    fn round_trip(version: i32, unversioned: bool) {
+        let mut original = summary(version, true);
+        original.versioning_info.is_unversioned = unversioned;
+        let mut bytes = Vec::new();
+        original.serialize(&mut bytes).unwrap();
+        let mut reader = Cursor::new(&bytes);
+        let decoded = FLegacyPackageFileSummary::deserialize(
+            &mut reader,
+            Some(original.versioning_info.package_file_version),
+        ).unwrap();
+        assert_eq!(reader.position(), bytes.len() as u64);
+        assert_eq!(decoded.versioning_info.package_file_version.file_version_ue4, version);
+        assert_eq!(decoded.versioning_info.is_unversioned, unversioned);
+        assert_eq!(decoded.package_name, original.package_name);
+        assert_eq!(decoded.package_flags, original.package_flags);
+        let mut repeated = Vec::new();
+        decoded.serialize(&mut repeated).unwrap();
+        assert_eq!(bytes, repeated);
+
+        // Filtered cooked imports have no editor-only package-name field at either version.
+        let import = FObjectImport {
+            class_package: FMinimalName { index: 1, number: 0 },
+            class_name: FMinimalName { index: 2, number: 0 },
+            object_name: FMinimalName { index: 3, number: 0 },
+            ..Default::default()
+        };
+        let mut import_bytes = Vec::new();
+        import.serialize(&mut import_bytes, &original).unwrap();
+        assert_eq!(import_bytes.len(), 28);
+        let mut import_reader = Cursor::new(&import_bytes);
+        let decoded_import = FObjectImport::deserialize(&mut import_reader, &decoded).unwrap();
+        assert_eq!(import_reader.position(), 28);
+        assert_eq!(decoded_import.class_package.index, 1);
+        assert_eq!(decoded_import.class_name.index, 2);
+        assert_eq!(decoded_import.object_name.index, 3);
+    }
+
+    #[test]
+    fn cooked_518_summary_and_import_round_trip() {
+        round_trip(518, false);
+        round_trip(518, true);
+    }
+
+    #[test]
+    fn cooked_519_summary_and_import_round_trip() {
+        round_trip(519, false);
+        round_trip(519, true);
+    }
+
+    #[test]
+    fn cooked_522_summary_and_import_round_trip() {
+        round_trip(522, false);
+        round_trip(522, true);
+    }
+
+    #[test]
+    fn pre_ue425_cooked_summary_is_rejected() {
+        let error = summary(517, true).serialize(&mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("517"));
+    }
+
+    #[test]
+    fn editor_data_518_and_519_are_rejected() {
+        for version in [518, 519] {
+            assert!(summary(version, false).serialize(&mut Vec::new()).is_err());
+        }
+    }
+}
